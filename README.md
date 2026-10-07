@@ -1,36 +1,43 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Knicks Win Closure Map
 
-## Getting Started
+PMAI NYC, Challenge 2. Official alerts, social posts and crowd reports go in; you get a live map of street closures with a confidence score for each, plus a route home that avoids them.
 
-First, run the development server:
-
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+```
+Feed (official / social / report) → Claude extraction → geocode onto street grid
+   → fuse + confidence score → MapLibre map → Valhalla routing that avoids closures
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+## Run
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+```bash
+cp .env.example .env.local   # add OPENROUTER_API_KEY (optional)
+npm install
+npm run dev                  # http://localhost:3000
+```
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+Press **Plan route** (default: Hell's Kitchen bar → Lower East Side, driving), then **Start replay**.
+At about 10:42 PM, NYC DOT confirms the Times Square closures. Your route then re-plans by itself around them,
+and the old route stays on the map as a dashed line.
 
-## Learn More
+## How it works
 
-To learn more about Next.js, take a look at the following resources:
+| File | What it does |
+| --- | --- |
+| `src/lib/scenario.ts` | Scripted championship night: 14 timed events, including a rumor, corroborating posts and a reopening |
+| `src/lib/extract.ts` | Claude via OpenRouter (`anthropic/claude-opus-5.5`, JSON-schema structured output) turns free text into closure claims: street, cross streets, place, mode, hearsay or stated |
+| `src/lib/heuristic.ts` | Regex fallback used when there's no API key or the call fails |
+| `src/lib/grid.ts` | Offline Manhattan grid model plus named places, which turns claims into lines and avoid-polygons |
+| `src/lib/fuse.ts` | Groups claims by segment and scores them with noisy-OR: official 0.9, crowd report 0.5, social 0.35, hearsay ×0.4. Unofficial reports decay over time; an official "reopened" clears the closure |
+| `src/app/api/route` | Valhalla `exclude_polygons`, run once as a baseline and once with closures avoided |
+| `src/components/Dashboard.tsx` | Replay clock, live feed, "Report a closure" box, closure list, route planner |
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+Tiers: **confirmed** ≥ 85%, **likely** ≥ 50%, **rumored** below that. The planner avoids every closure at or above the slider threshold.
+Driving avoids `vehicles` and `all` closures. Walking avoids `pedestrians` and `all`. Transit notices are shown but don't change routes.
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+## Next steps (real data)
 
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+- **Official:** NYC511 events, NYC DOT weekly advisories, Notify NYC, NYC Open Data street-closure and SAPO event permits, MTA GTFS-rt alerts
+- **Social:** Bluesky firehose (open), Reddit r/nyc and r/NYKnicks, X if you have API access
+- **Geocoding:** swap `grid.ts` for NYC LION centerlines or NYC GeoSearch (`geosearch.planninglabs.nyc`)
+- **Clustering:** merge overlapping geometries spatially instead of by exact segment key
+- **Routing:** self-host Valhalla (Docker) and add transit routing via MTA GTFS
