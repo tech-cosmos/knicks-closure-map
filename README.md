@@ -1,5 +1,9 @@
 # Knicks Win Closure Map
 
+**Live demo:** https://knicks-closure-map.vercel.app
+
+![Knicks Win Closure Map: live feed, closures by confidence, and a route home that detours around Times Square](docs/screenshot.png)
+
 PMAI NYC, Challenge 2. Official alerts, social posts and crowd reports go in; you get a live map of street closures with a confidence score for each, plus a route home that avoids them.
 
 ```
