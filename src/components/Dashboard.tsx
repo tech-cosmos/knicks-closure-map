@@ -23,10 +23,25 @@ type RouteLeg = { line: LngLat[]; minutes: number; km: number };
 type RouteState = {
   baseline: RouteLeg;
   adjusted: RouteLeg;
-  avoided: string[];
-  blockedOnBaseline: string[];
-  skipped: string[];
+  /** Avoided closures the usual (fastest) route would have gone through. */
+  detouredAround: FusedClosure[];
+  /** Closures the recommended route still touches because they're below the avoid level. */
+  passesThrough: FusedClosure[];
+  /** Avoided closures containing the start or end point (can't be routed around). */
+  skipped: FusedClosure[];
+  /** Lowest-confidence closures dropped to stay under the router's polygon limit. */
+  overLimit: FusedClosure[];
 };
+
+/** The public Valhalla server rejects requests with more exclude_polygons vertices than this. */
+const MAX_AVOID_VERTICES = 100;
+
+const AVOID_LEVELS = [
+  { id: "confirmed", label: "Confirmed", min: 0.85 },
+  { id: "likely", label: "+ Likely", min: 0.5 },
+  { id: "all", label: "+ Rumors", min: 0.05 },
+] as const;
+type AvoidLevel = (typeof AVOID_LEVELS)[number]["id"];
 
 const SOURCE_BADGE: Record<SourceType, string> = {
   official: "bg-blue-100 text-blue-800",
@@ -50,9 +65,21 @@ function pointInRing([x, y]: LngLat, ring: LngLat[]) {
 }
 const hits = (pt: LngLat, c: FusedClosure) => c.geo.polygons.some((ring) => pointInRing(pt, ring));
 
-function blocks(c: FusedClosure, costing: Costing) {
-  if (c.mode === "transit") return false;
-  return c.mode === "all" || (costing === "auto" ? c.mode === "vehicles" : c.mode === "pedestrians");
+/**
+ * Tonight, street closures are caused by crowds, so walkers avoid them too even when the
+ * alert says "closed to vehicles". Transit notices (station entrances) never block streets.
+ */
+const blocksStreets = (c: FusedClosure) => c.mode !== "transit";
+/** Does the route touch the closure? Samples every ~10 m, since route vertices sit at intersections. */
+function crosses(line: LngLat[], c: FusedClosure) {
+  for (let i = 1; i < line.length; i++) {
+    const [a, b] = [line[i - 1], line[i]];
+    const steps = Math.max(1, Math.ceil(Math.hypot((b[0] - a[0]) * 84_000, (b[1] - a[1]) * 111_000) / 10));
+    for (let k = 0; k <= steps; k++) {
+      if (hits([a[0] + ((b[0] - a[0]) * k) / steps, a[1] + ((b[1] - a[1]) * k) / steps], c)) return true;
+    }
+  }
+  return false;
 }
 
 export default function Dashboard() {
@@ -61,7 +88,7 @@ export default function Dashboard() {
   const [speed, setSpeed] = useState(1); // sim minutes per real second
   const [feed, setFeed] = useState<FeedItem[]>([]);
   const [reports, setReports] = useState<Report[]>([]);
-  const [threshold, setThreshold] = useState(0.5);
+  const [avoidLevel, setAvoidLevel] = useState<AvoidLevel>("likely");
   const [costing, setCosting] = useState<Costing>("auto");
   const [fromId, setFromId] = useState("bar");
   const [toId, setToId] = useState("les");
@@ -126,7 +153,6 @@ export default function Dashboard() {
     setSimTime(0);
     setFeed([]);
     setReports([]);
-    setRoute(null);
     seen.current.clear();
   };
 
@@ -136,54 +162,74 @@ export default function Dashboard() {
   // --- Routing ----------------------------------------------------------------
   const from = ROUTE_POINTS.find((p) => p.id === fromId)!.at;
   const to = ROUTE_POINTS.find((p) => p.id === toId)!.at;
+  const threshold = AVOID_LEVELS.find((l) => l.id === avoidLevel)!.min;
   const avoidSet = useMemo(
-    () => closures.filter((c) => c.confidence >= threshold && blocks(c, costing)),
-    [closures, threshold, costing],
+    () => closures.filter((c) => c.confidence >= threshold && blocksStreets(c)),
+    [closures, threshold],
   );
-  const avoidSignature = avoidSet.map((c) => c.key).sort().join("|");
+  const avoidedKeys = useMemo(() => new Set(avoidSet.map((c) => c.key)), [avoidSet]);
+  const avoidSignature = [...avoidedKeys].sort().join("|");
 
-  const plan = useCallback(async () => {
-    setRouting(true);
-    setRouteError(null);
-    // Valhalla can't route out of an excluded polygon, so skip closures containing an endpoint.
-    const usable = avoidSet.filter((c) => !hits(from, c) && !hits(to, c));
-    const skipped = avoidSet.filter((c) => !usable.includes(c)).map((c) => c.label);
-    try {
-      const res = await fetch("/api/route", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ from, to, costing, avoid: usable.flatMap((c) => c.geo.polygons) }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error ?? "Routing failed");
-      const blockedOnBaseline = usable
-        .filter((c) => (data.baseline.line as LngLat[]).some((pt) => hits(pt, c)))
-        .map((c) => c.label);
-      setRoute({ ...data, avoided: usable.map((c) => c.label), blockedOnBaseline, skipped });
-    } catch (err) {
-      setRouteError((err as Error).message);
-    } finally {
-      setRouting(false);
-    }
-  }, [avoidSet, from, to, costing]);
+  const latestClosures = useRef(closures);
+  latestClosures.current = closures;
+  const requestId = useRef(0);
 
-  // Re-plan automatically when the set of closures we avoid changes.
-  const planRef = useRef(plan);
-  planRef.current = plan;
-  const hasRoute = route !== null;
+  // Always keep a route on screen: re-plan whenever the trip or the avoided closures change.
   useEffect(() => {
-    if (hasRoute) void planRef.current();
+    const id = ++requestId.current;
+    const timer = setTimeout(async () => {
+      setRouting(true);
+      setRouteError(null);
+      // Valhalla can't route out of an excluded polygon, so skip closures containing an endpoint.
+      const routable = avoidSet.filter((c) => !hits(from, c) && !hits(to, c));
+      const skipped = avoidSet.filter((c) => !routable.includes(c));
+      // Keep the most confident closures that fit the router's vertex budget (avoidSet is sorted by confidence).
+      const usable: FusedClosure[] = [], overLimit: FusedClosure[] = [];
+      let vertices = 0;
+      for (const c of routable) {
+        const n = c.geo.polygons.reduce((sum, ring) => sum + ring.length, 0);
+        if (vertices + n <= MAX_AVOID_VERTICES) {
+          usable.push(c);
+          vertices += n;
+        } else overLimit.push(c);
+      }
+      try {
+        const res = await fetch("/api/route", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ from, to, costing, avoid: usable.flatMap((c) => c.geo.polygons) }),
+        });
+        const data = await res.json();
+        if (id !== requestId.current) return; // a newer request superseded this one
+        if (!res.ok) throw new Error(data.error ?? "Routing failed");
+        const usableKeys = new Set(usable.map((c) => c.key));
+        setRoute({
+          baseline: data.baseline,
+          adjusted: data.adjusted,
+          detouredAround: usable.filter((c) => crosses(data.baseline.line, c)),
+          passesThrough: latestClosures.current.filter(
+            (c) => blocksStreets(c) && !usableKeys.has(c.key) && crosses(data.adjusted.line, c),
+          ),
+          skipped,
+          overLimit,
+        });
+      } catch (err) {
+        if (id === requestId.current) setRouteError((err as Error).message);
+      } finally {
+        if (id === requestId.current) setRouting(false);
+      }
+    }, 300);
+    return () => clearTimeout(timer);
+    // avoidSignature stands in for avoidSet; confidence wiggles alone shouldn't re-route.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [avoidSignature, costing, fromId, toId]);
 
   const mapRoutes: MapRoutes = useMemo(() => ({
-    baseline: route && route.blockedOnBaseline.length ? route.baseline.line : undefined,
+    baseline: route && route.detouredAround.length ? route.baseline.line : undefined,
     adjusted: route?.adjusted.line,
     from,
     to,
   }), [route, from, to]);
-
-  const delta = route ? route.adjusted.minutes - route.baseline.minutes : 0;
 
   return (
     <div className="flex h-screen w-full flex-col bg-neutral-50 text-neutral-900 md:flex-row">
@@ -252,7 +298,7 @@ export default function Dashboard() {
 
       {/* Map + overlays */}
       <main className="relative min-h-[60vh] flex-1">
-        <MapView closures={closures} routes={mapRoutes} />
+        <MapView closures={closures} avoidedKeys={avoidedKeys} routes={mapRoutes} />
 
         {/* Closure list / legend */}
         <div className="absolute left-3 top-3 w-72 max-h-[45%] overflow-y-auto rounded-lg bg-white/95 p-3 text-sm shadow-lg">
@@ -272,14 +318,15 @@ export default function Dashboard() {
               <li key={c.key} className="text-xs">
                 <div className="flex items-center gap-2">
                   <i className="inline-block h-2.5 w-2.5 shrink-0 rounded-full" style={{ background: c.mode === "transit" ? "#2563eb" : TIER_COLOR[c.tier] }} />
-                  <span className="flex-1 font-medium">{c.label}</span>
+                  <span className={`flex-1 font-medium ${blocksStreets(c) && !avoidedKeys.has(c.key) ? "text-neutral-400" : ""}`}>{c.label}</span>
                   <span className="font-mono">{Math.round(c.confidence * 100)}%</span>
                 </div>
                 <div className="ml-4 h-1 rounded bg-neutral-100">
                   <div className="h-1 rounded" style={{ width: `${c.confidence * 100}%`, background: c.mode === "transit" ? "#2563eb" : TIER_COLOR[c.tier] }} />
                 </div>
                 <div className="ml-4 text-[10px] text-neutral-500">
-                  {c.counts.official} official · {c.counts.social} social · {c.counts.report} reports · {c.mode}
+                  {c.counts.official} official · {c.counts.social} social · {c.counts.report} reports
+                  {c.mode === "transit" ? " · transit only" : avoidedKeys.has(c.key) ? " · avoiding" : " · not avoiding"}
                 </div>
               </li>
             ))}
@@ -288,7 +335,17 @@ export default function Dashboard() {
 
         {/* Route planner */}
         <div className="absolute bottom-3 left-3 right-3 rounded-lg bg-white/95 p-3 text-sm shadow-lg md:right-auto md:w-[380px]">
-          <h2 className="mb-2 font-semibold">Get me home</h2>
+          <div className="mb-2 flex items-center justify-between">
+            <h2 className="font-semibold">Get me home</h2>
+            <div className="flex rounded-md border border-neutral-300 p-0.5 text-xs">
+              {(["auto", "pedestrian"] as const).map((c) => (
+                <button key={c} onClick={() => setCosting(c)}
+                  className={`rounded px-2 py-0.5 ${costing === c ? "bg-neutral-900 text-white" : "text-neutral-600"}`}>
+                  {c === "auto" ? "🚕 Drive" : "🚶 Walk"}
+                </button>
+              ))}
+            </div>
+          </div>
           <div className="grid grid-cols-[40px_1fr] items-center gap-x-2 gap-y-1.5 text-xs">
             <span className="text-neutral-500">From</span>
             <select value={fromId} onChange={(e) => setFromId(e.target.value)} className="rounded border border-neutral-300 px-1 py-1">
@@ -298,46 +355,65 @@ export default function Dashboard() {
             <select value={toId} onChange={(e) => setToId(e.target.value)} className="rounded border border-neutral-300 px-1 py-1">
               {ROUTE_POINTS.map((p) => <option key={p.id} value={p.id}>{p.label}</option>)}
             </select>
-          </div>
-          <div className="mt-2 flex items-center gap-2 text-xs">
-            {(["auto", "pedestrian"] as const).map((c) => (
-              <button key={c} onClick={() => setCosting(c)}
-                className={`rounded-md px-2 py-1 ${costing === c ? "bg-neutral-900 text-white" : "border border-neutral-300"}`}>
-                {c === "auto" ? "🚕 Drive" : "🚶 Walk"}
-              </button>
-            ))}
-            <label className="ml-auto flex items-center gap-1 text-neutral-600" title="Avoid closures at or above this confidence">
-              Avoid ≥
-              <input type="range" min={0.1} max={0.9} step={0.05} value={threshold} onChange={(e) => setThreshold(+e.target.value)} className="w-20" />
-              <span className="w-8 font-mono">{Math.round(threshold * 100)}%</span>
-            </label>
-          </div>
-          <button onClick={() => void plan()} disabled={routing}
-            className="mt-2 w-full rounded-md bg-green-600 py-1.5 font-medium text-white hover:bg-green-500 disabled:opacity-60">
-            {routing ? "Routing…" : route ? "Re-plan route" : "Plan route"}
-          </button>
-          {routeError && <p className="mt-2 text-xs text-red-600">{routeError}</p>}
-          {route && (
-            <div className="mt-2 space-y-1 text-xs">
-              <div className="flex justify-between">
-                <span>Recommended route</span>
-                <span className="font-mono font-semibold">{route.adjusted.minutes.toFixed(0)} min · {route.adjusted.km.toFixed(1)} km</span>
-              </div>
-              {route.blockedOnBaseline.length > 0 ? (
-                <p className="rounded bg-orange-50 p-1.5 text-orange-800">
-                  Usual route ({route.baseline.minutes.toFixed(0)} min, dashed) goes through{" "}
-                  <b>{route.blockedOnBaseline.join(", ")}</b>.{" "}
-                  {Math.round(delta) > 0 ? `The detour adds ${Math.round(delta)} min.` : "The detour takes about the same time."}
-                </p>
-              ) : (
-                <p className="text-neutral-500">Your usual route is clear of the {route.avoided.length} closures you&apos;re avoiding.</p>
-              )}
-              {route.skipped.length > 0 && (
-                <p className="text-neutral-500">Starting or ending inside {route.skipped.join(", ")}, so that closure can&apos;t be avoided.</p>
-              )}
-              <p className="text-[10px] text-neutral-400">Re-plans automatically when the closure picture changes.</p>
+            <span className="text-neutral-500">Avoid</span>
+            <div className="flex rounded-md border border-neutral-300 p-0.5">
+              {AVOID_LEVELS.map((l) => (
+                <button key={l.id} onClick={() => setAvoidLevel(l.id)}
+                  className={`flex-1 rounded px-1.5 py-0.5 ${avoidLevel === l.id ? "bg-neutral-900 text-white" : "text-neutral-600"}`}>
+                  {l.label}
+                </button>
+              ))}
             </div>
-          )}
+          </div>
+
+          <div className="mt-3 border-t border-neutral-200 pt-2 text-xs">
+            {routeError ? (
+              <p className="text-red-600">{routeError}</p>
+            ) : !route ? (
+              <p className="text-neutral-500">Finding a route…</p>
+            ) : (
+              <div className="space-y-1.5">
+                <div className="flex items-baseline justify-between">
+                  <span className="flex items-center gap-1.5 font-medium">
+                    <i className="inline-block h-1 w-4 rounded bg-green-600" /> Your route
+                    {routing && <span className="animate-pulse text-neutral-400">updating…</span>}
+                  </span>
+                  <span className="font-mono text-sm font-semibold">
+                    {route.adjusted.minutes.toFixed(0)} min · {route.adjusted.km.toFixed(1)} km
+                  </span>
+                </div>
+                {route.detouredAround.length > 0 ? (
+                  <p className="rounded bg-green-50 p-1.5 text-green-900">
+                    ✓ Detours around <b>{route.detouredAround.map((c) => c.label).join(", ")}</b>.{" "}
+                    The usual route (gray dashes) would take {route.baseline.minutes.toFixed(0)} min if the streets were clear
+                    {Math.round(route.adjusted.minutes - route.baseline.minutes) > 0
+                      ? `; this one adds ${Math.round(route.adjusted.minutes - route.baseline.minutes)} min.`
+                      : "."}
+                  </p>
+                ) : (
+                  <p className="text-green-800">✓ No closures on this route.</p>
+                )}
+                {route.passesThrough.length > 0 && (
+                  <p className="rounded bg-yellow-50 p-1.5 text-yellow-900">
+                    Goes through {route.passesThrough.map((c) => `${c.label} (${c.tier}, ${Math.round(c.confidence * 100)}%)`).join(", ")}.
+                    {avoidLevel !== "all" && (
+                      <>{" "}<button onClick={() => setAvoidLevel(avoidLevel === "confirmed" ? "likely" : "all")} className="underline">Avoid these too</button></>
+                    )}
+                  </p>
+                )}
+                {route.overLimit.length > 0 && (
+                  <p className="text-neutral-500">
+                    Too many closures for the router at once. Not avoiding the least certain: {route.overLimit.map((c) => c.label).join(", ")}.
+                  </p>
+                )}
+                {route.skipped.length > 0 && (
+                  <p className="text-neutral-500">
+                    You&apos;re starting or ending inside {route.skipped.map((c) => c.label).join(", ")}, so it can&apos;t be avoided.
+                  </p>
+                )}
+              </div>
+            )}
+          </div>
         </div>
       </main>
     </div>

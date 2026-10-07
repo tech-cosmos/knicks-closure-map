@@ -87,25 +87,52 @@ export function parseName(raw: string, hint?: "avenue" | "street"): Parsed | nul
 const ordinal = (n: number) =>
   `${n}${n % 100 >= 11 && n % 100 <= 13 ? "th" : ["th", "st", "nd", "rd"][n % 10] ?? "th"}`;
 
-/** Rectangle of half-width `w` meters around the segment a→b, in lng/lat. */
-function bufferSegment(a: LngLat, b: LngLat, w = 18): LngLat[] {
-  const ax = (a[0] - ORIGIN.lng) * M_PER_DEG_LNG, ay = (a[1] - ORIGIN.lat) * M_PER_DEG_LAT;
-  const bx = (b[0] - ORIGIN.lng) * M_PER_DEG_LNG, by = (b[1] - ORIGIN.lat) * M_PER_DEG_LAT;
-  const len = Math.hypot(bx - ax, by - ay) || 1;
-  const nx = (-(by - ay) / len) * w, ny = ((bx - ax) / len) * w;
-  const tx = ((bx - ax) / len) * w, ty = ((by - ay) / len) * w; // extend past the ends a bit
-  const pts: [number, number][] = [
-    [ax - tx + nx, ay - ty + ny], [bx + tx + nx, by + ty + ny],
-    [bx + tx - nx, by + ty - ny], [ax - tx - nx, ay - ty - ny],
-  ];
-  const ring = pts.map(([x, y]) => [ORIGIN.lng + x / M_PER_DEG_LNG, ORIGIN.lat + y / M_PER_DEG_LAT] as LngLat);
+const toLocal = ([lng, lat]: LngLat): [number, number] => [(lng - ORIGIN.lng) * M_PER_DEG_LNG, (lat - ORIGIN.lat) * M_PER_DEG_LAT];
+const fromLocal = ([x, y]: [number, number]): LngLat => [ORIGIN.lng + x / M_PER_DEG_LNG, ORIGIN.lat + y / M_PER_DEG_LAT];
+
+/** Drop points where the line barely turns, so straight avenues become 2 points. */
+function simplify(pts: [number, number][]): [number, number][] {
+  if (pts.length <= 2) return pts;
+  const out = [pts[0]];
+  for (let i = 1; i < pts.length - 1; i++) {
+    const [a, b, c] = [out[out.length - 1], pts[i], pts[i + 1]];
+    const turn = Math.abs(Math.atan2(c[1] - b[1], c[0] - b[0]) - Math.atan2(b[1] - a[1], b[0] - a[0]));
+    if (Math.min(turn, 2 * Math.PI - turn) > (3 * Math.PI) / 180) out.push(b);
+  }
+  out.push(pts[pts.length - 1]);
+  return out;
+}
+
+/**
+ * One closed ring of half-width `w` meters around the whole closed stretch. The ends stop
+ * `trim` meters short of the first/last intersection so routes can still cross there.
+ * One ring per closure keeps us under Valhalla's exclude_polygons vertex limit.
+ */
+function bufferLine(line: LngLat[], w = 18, trim = 22): LngLat[] {
+  const pts = simplify(line.map(toLocal));
+  const unit = (a: [number, number], b: [number, number]) => {
+    const len = Math.hypot(b[0] - a[0], b[1] - a[1]) || 1;
+    return [(b[0] - a[0]) / len, (b[1] - a[1]) / len] as const;
+  };
+  // Pull the end points inward.
+  const [ux0, uy0] = unit(pts[0], pts[1]);
+  const [ux1, uy1] = unit(pts[pts.length - 2], pts[pts.length - 1]);
+  pts[0] = [pts[0][0] + ux0 * trim, pts[0][1] + uy0 * trim];
+  pts[pts.length - 1] = [pts[pts.length - 1][0] - ux1 * trim, pts[pts.length - 1][1] - uy1 * trim];
+
+  const left: [number, number][] = [], right: [number, number][] = [];
+  pts.forEach((p, i) => {
+    // Normal = average of adjacent segment normals (fine for the gentle bends we have).
+    const [dx, dy] = unit(pts[Math.max(0, i - 1)], pts[Math.min(pts.length - 1, i + 1)]);
+    left.push([p[0] - dy * w, p[1] + dx * w]);
+    right.push([p[0] + dy * w, p[1] - dx * w]);
+  });
+  const ring = [...left, ...right.reverse()].map(fromLocal);
   return [...ring, ring[0]];
 }
 
 function lineGeometry(key: string, label: string, line: LngLat[]): ClosureGeometry {
-  const polygons: LngLat[][] = [];
-  for (let i = 1; i < line.length; i++) polygons.push(bufferSegment(line[i - 1], line[i]));
-  return { key, label, line, polygons, area: false };
+  return { key, label, line, polygons: [bufferLine(line)], area: false };
 }
 
 function rectGeometry(key: string, label: string, aves: [string, string], streets: [number, number]): ClosureGeometry {

@@ -16,7 +16,7 @@ export interface MapRoutes {
   to?: LngLat;
 }
 
-function closuresGeoJSON(closures: FusedClosure[]): GeoJSON.FeatureCollection {
+function closuresGeoJSON(closures: FusedClosure[], avoided: Set<string>): GeoJSON.FeatureCollection {
   return {
     type: "FeatureCollection",
     features: closures.flatMap((c) => {
@@ -27,6 +27,9 @@ function closuresGeoJSON(closures: FusedClosure[]): GeoJSON.FeatureCollection {
         confidence: Math.round(c.confidence * 100),
         tier: c.tier,
         mode: c.mode,
+        // Closures the router ignores (below the avoid level) are drawn faded.
+        opacity: c.mode === "transit" || avoided.has(c.key) ? 1 : 0.35,
+        status: c.mode === "transit" ? "transit only" : avoided.has(c.key) ? "avoiding" : "not avoiding",
         sources: `${c.counts.official} official · ${c.counts.social} social · ${c.counts.report} reports`,
       };
       return [
@@ -54,12 +57,16 @@ function pointsFC(points: (LngLat | undefined)[]): GeoJSON.FeatureCollection {
   };
 }
 
-export default function MapView({ closures, routes }: { closures: FusedClosure[]; routes: MapRoutes }) {
+export default function MapView({ closures, avoidedKeys, routes }: {
+  closures: FusedClosure[];
+  avoidedKeys: Set<string>;
+  routes: MapRoutes;
+}) {
   const container = useRef<HTMLDivElement>(null);
   const mapRef = useRef<MLMap | null>(null);
   const loaded = useRef(false);
-  const latest = useRef({ closures, routes });
-  latest.current = { closures, routes };
+  const latest = useRef({ closures, avoidedKeys, routes });
+  latest.current = { closures, avoidedKeys, routes };
 
   useEffect(() => {
     if (!container.current) return;
@@ -73,7 +80,7 @@ export default function MapView({ closures, routes }: { closures: FusedClosure[]
     map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "top-right");
 
     map.on("load", () => {
-      map.addSource("closures", { type: "geojson", data: closuresGeoJSON([]) });
+      map.addSource("closures", { type: "geojson", data: closuresGeoJSON([], new Set()) });
       map.addSource("baseline", { type: "geojson", data: lineFC() });
       map.addSource("adjusted", { type: "geojson", data: lineFC() });
       map.addSource("endpoints", { type: "geojson", data: pointsFC([]) });
@@ -84,12 +91,12 @@ export default function MapView({ closures, routes }: { closures: FusedClosure[]
         layout: { "line-cap": "round", "line-join": "round" },
         paint: { "line-color": "#16a34a", "line-width": 5, "line-opacity": 0.9 } });
       map.addLayer({ id: "closure-areas", type: "fill", source: "closures", filter: ["==", ["get", "area"], 1],
-        paint: { "fill-color": ["get", "color"], "fill-opacity": ["interpolate", ["linear"], ["get", "confidence"], 0, 0.1, 100, 0.35] } });
+        paint: { "fill-color": ["get", "color"], "fill-opacity": ["*", ["get", "opacity"], ["interpolate", ["linear"], ["get", "confidence"], 0, 0.1, 100, 0.35]] } });
       map.addLayer({ id: "closure-area-outline", type: "line", source: "closures", filter: ["==", ["get", "area"], 1],
-        paint: { "line-color": ["get", "color"], "line-width": 2, "line-dasharray": [2, 1] } });
+        paint: { "line-color": ["get", "color"], "line-width": 2, "line-dasharray": [2, 1], "line-opacity": ["get", "opacity"] } });
       map.addLayer({ id: "closure-lines", type: "line", source: "closures", filter: ["==", ["get", "area"], 0],
         layout: { "line-cap": "round" },
-        paint: { "line-color": ["get", "color"], "line-width": ["interpolate", ["linear"], ["get", "confidence"], 0, 4, 100, 9], "line-opacity": 0.85 } });
+        paint: { "line-color": ["get", "color"], "line-width": ["interpolate", ["linear"], ["get", "confidence"], 0, 4, 100, 9], "line-opacity": ["*", 0.85, ["get", "opacity"]] } });
       map.addLayer({ id: "endpoints", type: "circle", source: "endpoints",
         paint: { "circle-radius": 7, "circle-color": ["match", ["get", "role"], "A", "#111827", "#16a34a"], "circle-stroke-color": "#fff", "circle-stroke-width": 2 } });
 
@@ -99,14 +106,14 @@ export default function MapView({ closures, routes }: { closures: FusedClosure[]
           if (!p) return;
           new maplibregl.Popup({ closeButton: false })
             .setLngLat(e.lngLat)
-            .setHTML(`<strong>${p.label}</strong><br/>${p.tier} · ${p.confidence}% · ${p.mode}<br/><span style="color:#6b7280">${p.sources}</span>`)
+            .setHTML(`<strong>${p.label}</strong><br/>${p.tier} · ${p.confidence}% · ${p.status}<br/><span style="color:#6b7280">${p.sources}</span>`)
             .addTo(map);
         });
         map.on("mouseenter", layer, () => (map.getCanvas().style.cursor = "pointer"));
         map.on("mouseleave", layer, () => (map.getCanvas().style.cursor = ""));
       }
       loaded.current = true;
-      sync(map, latest.current.closures, latest.current.routes);
+      sync(map, latest.current.closures, latest.current.avoidedKeys, latest.current.routes);
     });
     return () => {
       loaded.current = false;
@@ -115,14 +122,14 @@ export default function MapView({ closures, routes }: { closures: FusedClosure[]
   }, []);
 
   useEffect(() => {
-    if (mapRef.current && loaded.current) sync(mapRef.current, closures, routes);
-  }, [closures, routes]);
+    if (mapRef.current && loaded.current) sync(mapRef.current, closures, avoidedKeys, routes);
+  }, [closures, avoidedKeys, routes]);
 
   return <div ref={container} className="h-full w-full" />;
 }
 
-function sync(map: MLMap, closures: FusedClosure[], routes: MapRoutes) {
-  (map.getSource("closures") as GeoJSONSource).setData(closuresGeoJSON(closures));
+function sync(map: MLMap, closures: FusedClosure[], avoidedKeys: Set<string>, routes: MapRoutes) {
+  (map.getSource("closures") as GeoJSONSource).setData(closuresGeoJSON(closures, avoidedKeys));
   (map.getSource("baseline") as GeoJSONSource).setData(lineFC(routes.baseline));
   (map.getSource("adjusted") as GeoJSONSource).setData(lineFC(routes.adjusted));
   (map.getSource("endpoints") as GeoJSONSource).setData(pointsFC([routes.from, routes.to]));
