@@ -49,7 +49,9 @@ export function fuse(reports: Report[], now: number): FusedClosure[] {
       }
       const age = now - r.t;
       const decay = Math.pow(0.5, age / HALF_LIFE_MIN[r.source]);
-      const p = WEIGHT[r.source] * decay * (r.claim.certainty === "hearsay" ? HEARSAY_FACTOR : 1);
+      // With Jev, slide between the hearsay and stated weights by its probability instead of a hard label.
+      const statedP = r.stated ?? (r.claim.certainty === "hearsay" ? 0 : 1);
+      const p = WEIGHT[r.source] * decay * (HEARSAY_FACTOR + (1 - HEARSAY_FACTOR) * statedP);
       miss *= 1 - p;
       active.push(r);
     }

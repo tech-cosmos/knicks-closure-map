@@ -5,7 +5,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { fuse, TIER_COLOR } from "@/lib/fuse";
 import { ROUTE_POINTS } from "@/lib/grid";
 import { SCENARIO } from "@/lib/scenario";
-import type { ExtractResponse, FeedEvent, FusedClosure, LngLat, Report, SourceType } from "@/lib/types";
+import type { ExtractResponse, FeedEvent, FusedClosure, JevTriage, LngLat, Report, SourceType } from "@/lib/types";
 import type { MapRoutes } from "./MapView";
 
 const MapView = dynamic(() => import("./MapView"), { ssr: false });
@@ -16,6 +16,7 @@ type FeedItem = {
   engine?: ExtractResponse["engine"];
   placed?: number;
   unresolved?: number;
+  jev?: JevTriage | null;
 };
 
 type Costing = "auto" | "pedestrian";
@@ -54,6 +55,8 @@ function clock(t: number) {
   const h = Math.floor(base / 60) % 24, m = base % 60;
   return `${((h + 11) % 12) + 1}:${String(m).padStart(2, "0")} ${h >= 12 ? "PM" : "AM"}`;
 }
+
+const pct = (p: number) => `${Math.round(p * 100)}%`;
 
 function pointInRing([x, y]: LngLat, ring: LngLat[]) {
   let inside = false;
@@ -120,10 +123,11 @@ export default function Dashboard() {
         ...rs,
         ...data.placed.map(({ claim, geo }) => ({
           eventId: event.id, source: event.source, author: event.author, text: event.text, t: event.t, claim, geo,
+          stated: data.jev?.stated,
         })),
       ]);
       setFeed((f) => f.map((it) => it.event.id === event.id
-        ? { ...it, status: "done", engine: data.engine, placed: data.placed.length, unresolved: data.unresolved.length }
+        ? { ...it, status: "done", engine: data.engine, placed: data.placed.length, unresolved: data.unresolved.length, jev: data.jev }
         : it));
     } catch {
       setFeed((f) => f.map((it) => (it.event.id === event.id ? { ...it, status: "error" } : it)));
@@ -272,7 +276,7 @@ export default function Dashboard() {
           </div>
           {feed.length === 0 && <p className="py-6 text-center text-sm text-neutral-400">Press Start replay to begin the night.</p>}
           <ul className="space-y-2">
-            {feed.map(({ event, status, engine, placed, unresolved }) => (
+            {feed.map(({ event, status, engine, placed, unresolved, jev }) => (
               <li key={event.id} className="rounded-lg border border-neutral-200 p-2.5 text-sm">
                 <div className="mb-1 flex items-center gap-2 text-[11px]">
                   <span className={`rounded px-1.5 py-0.5 font-semibold uppercase ${SOURCE_BADGE[event.source]}`}>{event.source}</span>
@@ -283,10 +287,16 @@ export default function Dashboard() {
                 <div className="mt-1 text-[11px] text-neutral-500">
                   {status === "extracting" && <span className="animate-pulse">Extracting…</span>}
                   {status === "error" && <span className="text-red-600">Extraction failed</span>}
-                  {status === "done" && (
+                  {status === "done" && engine === "skipped" && <span>Skipped: Jev saw no closure</span>}
+                  {status === "done" && engine !== "skipped" && (
                     <span>
                       {placed ? `📍 ${placed} closure${placed > 1 ? "s" : ""} mapped` : "No closure found"}
                       {unresolved ? ` · ${unresolved} couldn't be placed` : ""} · via {engine}
+                    </span>
+                  )}
+                  {status === "done" && jev && (
+                    <span className="ml-1 font-mono text-violet-600" title="Jev: chance this reports a closure · chance it's first-hand rather than hearsay">
+                      · closure {pct(jev.relevant)} · first-hand {pct(jev.stated)}
                     </span>
                   )}
                 </div>
