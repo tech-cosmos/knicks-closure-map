@@ -2,10 +2,14 @@ import "server-only";
 import { z } from "zod";
 import { PLACE_DESCRIPTIONS, resolveClaim } from "./grid";
 import { heuristicExtract } from "./heuristic";
+import { jevTriage } from "./jev";
 import { PLACE_KEYS, type ClosureClaim, type ExtractResponse, type SourceType } from "./types";
 
 const OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
 const MODEL = process.env.OPENROUTER_MODEL ?? "anthropic/claude-opus-5.5";
+/** Skip extraction for non-official posts Jev rates below this chance of reporting a closure.
+ *  Kept low: dropping a real closure costs more than one extra Claude call. */
+const SKIP_BELOW = 0.2;
 
 const ClaimSchema = z.object({
   kind: z.enum(["segment", "place"]),
@@ -72,6 +76,12 @@ async function llmExtract(text: string, source: SourceType): Promise<ClosureClai
 }
 
 export async function extract(text: string, source: SourceType): Promise<ExtractResponse> {
+  // Jev triage (~100 ms) before the Claude call. Official alerts are few and matter most, so they always reach the extractor.
+  const jev = await jevTriage(text);
+  if (jev && source !== "official" && jev.relevant < SKIP_BELOW) {
+    return { placed: [], unresolved: [], engine: "skipped", jev };
+  }
+
   let claims: ClosureClaim[] | null = null;
   let engine: ExtractResponse["engine"] = "claude";
   if (process.env.EXTRACTOR !== "heuristic") {
@@ -93,5 +103,5 @@ export async function extract(text: string, source: SourceType): Promise<Extract
     if (geo) placed.push({ claim, geo });
     else unresolved.push(claim);
   }
-  return { placed, unresolved, engine };
+  return { placed, unresolved, engine, jev };
 }

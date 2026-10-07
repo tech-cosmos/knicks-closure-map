@@ -57,6 +57,16 @@ export interface Report {
   t: number;
   claim: ClosureClaim;
   geo: ClosureGeometry;
+  /** Jev's probability that the post states the closure first-hand. Replaces the hearsay label in fusion. */
+  stated?: number;
+}
+
+/** Jev's per-post probabilities (0–1). */
+export interface JevTriage {
+  /** The post reports a closure or reopening at all. */
+  relevant: number;
+  /** The post states it as fact rather than rumor or hearsay. */
+  stated: number;
 }
 
 export type Tier = "confirmed" | "likely" | "rumored";
@@ -76,5 +86,7 @@ export interface FusedClosure {
 export interface ExtractResponse {
   placed: { claim: ClosureClaim; geo: ClosureGeometry }[];
   unresolved: ClosureClaim[];
-  engine: "claude" | "heuristic";
+  /** "skipped": Jev said the post reports no closure, so no extractor ran. */
+  engine: "claude" | "heuristic" | "skipped";
+  jev: JevTriage | null;
 }
